@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crypto Tracker</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #09090b;
+    color: #e4e4e7;
+    font-family: 'Segoe UI', -apple-system, system-ui, sans-serif;
+    overflow: hidden;
+    width: 100vw;
+    height: 100vh;
+  }
+  .container {
+    display: grid;
+    grid-template-rows: repeat(4, 1fr);
+    gap: 4px;
+    padding: 6px;
+    height: 100%;
+    width: 100%;
+  }
+  .coin-card {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 8px;
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.3s;
+  }
+  .coin-card:hover { border-color: #3f3f46; }
+  .coin-card.up { border-left: 3px solid #10b981; }
+  .coin-card.down { border-left: 3px solid #ef4444; }
+  .coin-card.stale { opacity: 0.6; }
+
+  .coin-info {
+    flex-shrink: 0;
+    min-width: 0;
+    z-index: 1;
+  }
+  .coin-symbol {
+    font-size: 11px;
+    font-weight: 700;
+    color: #a1a1aa;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+  }
+  .coin-price {
+    font-size: 20px;
+    font-weight: 700;
+    color: #fafafa;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .coin-change {
+    font-size: 12px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .coin-change.up { color: #10b981; }
+  .coin-change.down { color: #ef4444; }
+
+  .sparkline-wrap {
+    flex: 1;
+    height: 100%;
+    min-width: 60px;
+    position: relative;
+  }
+  .sparkline-wrap canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+  }
+
+  .status-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 16px;
+    background: #09090b;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px;
+    font-size: 9px;
+    color: #52525b;
+    z-index: 10;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .status-dot.ok { background: #10b981; }
+  .status-dot.err { background: #ef4444; }
+  .status-dot.loading { background: #f59e0b; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+
+  /* Loading skeleton */
+  .coin-price.loading {
+    background: linear-gradient(90deg, #27272a 25%, #3f3f46 50%, #27272a 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+    border-radius: 4px;
+    color: transparent;
+    user-select: none;
+  }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+</style>
+</head>
+<body>
+
+<div class="container" id="grid"></div>
+
+<div class="status-bar">
+  <span><span class="status-dot loading" id="statusDot"></span><span id="statusText">Connecting...</span></span>
+  <span id="lastUpdate">--</span>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════
+// CONFIG — Edit coins here (CoinGecko IDs)
+// ═══════════════════════════════════════════════
+const COINS = [
+  { id: 'bitcoin',      symbol: 'BTC'  },
+  { id: 'ethereum',     symbol: 'ETH'  },
+  { id: 'bankercoin-2', symbol: 'BNKR' },
+  { id: 'irys',         symbol: 'IRYS' },
+];
+
+const PRICE_INTERVAL   = 30_000;   // Update prices every 30s
+const CHART_INTERVAL   = 300_000;  // Update charts every 5 min
+const RETRY_BASE_MS    = 5_000;    // Retry backoff base
+const MAX_RETRIES      = 3;
+const API = 'https://api.coingecko.com/api/v3';
+
+// ═══════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════
+const state = {
+  prices: {},      // { coinId: { price, change24h } }
+  charts: {},      // { coinId: [price, price, ...] }
+  lastGoodPrices: {},
+  status: 'loading',
+  lastUpdate: null,
+  errors: 0,
+};
+
+// ═══════════════════════════════════════════════
+// LOCAL STORAGE PERSISTENCE
+// ═══════════════════════════════════════════════
+function saveState() {
+  try {
+    localStorage.setItem('crypto-state', JSON.stringify({
+      prices: state.prices,
+      charts: state.charts,
+      lastUpdate: state.lastUpdate,
+    }));
+  } catch(e) {}
+}
+
+function loadState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('crypto-state'));
+    if (saved) {
+      state.prices = saved.prices || {};
+      state.charts = saved.charts || {};
+      state.lastUpdate = saved.lastUpdate;
+      state.lastGoodPrices = { ...saved.prices };
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+// ═══════════════════════════════════════════════
+// API
+// ═══════════════════════════════════════════════
+async function fetchWithRetry(url, retries = 0) {
+  try {
+    const res = await fetch(url);
+    if (res.status === 429) {
+      if (retries < MAX_RETRIES) {
+        const wait = RETRY_BASE_MS * Math.pow(2, retries) + Math.random() * 1000;
+        await new Promise(r => setTimeout(r, wait));
+        return fetchWithRetry(url, retries + 1);
+      }
+      throw new Error('Rate limited');
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  } catch(e) {
+    if (retries < MAX_RETRIES) {
+      const wait = RETRY_BASE_MS * (retries + 1);
+      await new Promise(r => setTimeout(r, wait));
+      return fetchWithRetry(url, retries + 1);
+    }
+    throw e;
+  }
+}
+
+async function fetchPrices() {
+  const ids = COINS.map(c => c.id).join(',');
+  const url = `${API}/coins/markets?vs_currency=usd&ids=${ids}&order=market_cap_desc&per_page=100&page=1&sparkline=false&price_change_percentage=24h`;
+
+  try {
+    const data = await fetchWithRetry(url);
+    data.forEach(coin => {
+      state.prices[coin.id] = {
+        price: coin.current_price,
+        change24h: coin.price_change_percentage_24h || 0,
+      };
+      state.lastGoodPrices[coin.id] = state.prices[coin.id];
+    });
+    state.lastUpdate = Date.now();
+    state.status = 'ok';
+    state.errors = 0;
+    saveState();
+  } catch(e) {
+    console.warn('Price fetch failed:', e.message);
+    state.errors++;
+    // Fall back to last known prices
+    if (Object.keys(state.lastGoodPrices).length > 0) {
+      state.prices = { ...state.lastGoodPrices };
+      state.status = 'stale';
+    } else {
+      state.status = 'error';
+    }
+  }
+  render();
+}
+
+async function fetchCharts() {
+  for (const coin of COINS) {
+    try {
+      // Small delay between requests
+      await new Promise(r => setTimeout(r, 1500));
+      const url = `${API}/coins/${coin.id}/market_chart?vs_currency=usd&days=1`;
+      const data = await fetchWithRetry(url);
+      if (data.prices && data.prices.length > 0) {
+        state.charts[coin.id] = data.prices.map(p => p[1]);
+        saveState();
+      }
+    } catch(e) {
+      console.warn(`Chart fetch failed for ${coin.id}:`, e.message);
+      // Keep existing chart data if available
+    }
+  }
+  render();
+}
+
+// ═══════════════════════════════════════════════
+// RENDERING
+// ═══════════════════════════════════════════════
+function formatPrice(price) {
+  if (price == null) return '---';
+  if (price >= 1000) return '$' + price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (price >= 1) return '$' + price.toFixed(2);
+  if (price >= 0.01) return '$' + price.toFixed(4);
+  return '$' + price.toFixed(6);
+}
+
+function formatChange(change) {
+  if (change == null) return '--';
+  const sign = change >= 0 ? '+' : '';
+  return sign + change.toFixed(2) + '%';
+}
+
+function drawSparkline(canvas, data, isUp) {
+  if (!data || data.length < 2) return;
+
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  canvas.width = w * dpr;
+  canvas.height = h * dpr;
+  ctx.scale(dpr, dpr);
+
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  const padding = 2;
+
+  const color = isUp ? '#10b981' : '#ef4444';
+  const fillColor = isUp ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)';
+
+  // Draw filled area
+  ctx.beginPath();
+  ctx.moveTo(padding, h - padding);
+  for (let i = 0; i < data.length; i++) {
+    const x = padding + (i / (data.length - 1)) * (w - padding * 2);
+    const y = padding + (1 - (data[i] - min) / range) * (h - padding * 2);
+    ctx.lineTo(x, y);
+  }
+  ctx.lineTo(w - padding, h - padding);
+  ctx.closePath();
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+
+  // Draw line
+  ctx.beginPath();
+  for (let i = 0; i < data.length; i++) {
+    const x = padding + (i / (data.length - 1)) * (w - padding * 2);
+    const y = padding + (1 - (data[i] - min) / range) * (h - padding * 2);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.stroke();
+}
+
+function buildGrid() {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  COINS.forEach((coin, i) => {
+    const card = document.createElement('div');
+    card.className = 'coin-card';
+    card.id = `card-${coin.id}`;
+    card.innerHTML = `
+      <div class="coin-info">
+        <div class="coin-symbol">${coin.symbol}</div>
+        <div class="coin-price loading" id="price-${coin.id}">$0,000.00</div>
+        <div class="coin-change" id="change-${coin.id}">--</div>
+      </div>
+      <div class="sparkline-wrap">
+        <canvas id="chart-${coin.id}"></canvas>
+      </div>
+    `;
+    grid.appendChild(card);
+  });
+}
+
+function render() {
+  COINS.forEach(coin => {
+    const priceEl = document.getElementById(`price-${coin.id}`);
+    const changeEl = document.getElementById(`change-${coin.id}`);
+    const cardEl = document.getElementById(`card-${coin.id}`);
+    const canvasEl = document.getElementById(`chart-${coin.id}`);
+
+    const data = state.prices[coin.id];
+    if (data) {
+      priceEl.textContent = formatPrice(data.price);
+      priceEl.classList.remove('loading');
+
+      const change = data.change24h;
+      changeEl.textContent = formatChange(change);
+      changeEl.className = `coin-change ${change >= 0 ? 'up' : 'down'}`;
+
+      cardEl.className = `coin-card ${change >= 0 ? 'up' : 'down'}${state.status === 'stale' ? ' stale' : ''}`;
+    }
+
+    // Draw sparkline
+    const chartData = state.charts[coin.id];
+    if (chartData && chartData.length > 1) {
+      const isUp = chartData[chartData.length - 1] >= chartData[0];
+      drawSparkline(canvasEl, chartData, isUp);
+    }
+  });
+
+  // Status bar
+  const dot = document.getElementById('statusDot');
+  const text = document.getElementById('statusText');
+  const update = document.getElementById('lastUpdate');
+
+  dot.className = `status-dot ${state.status === 'ok' ? 'ok' : state.status === 'stale' ? 'err' : state.status === 'error' ? 'err' : 'loading'}`;
+  text.textContent = state.status === 'ok' ? 'Live' : state.status === 'stale' ? 'Cached' : state.status === 'error' ? 'Offline' : 'Loading...';
+
+  if (state.lastUpdate) {
+    const ago = Math.round((Date.now() - state.lastUpdate) / 1000);
+    update.textContent = ago < 60 ? `${ago}s ago` : `${Math.round(ago / 60)}m ago`;
+  }
+}
+
+// ═══════════════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════════════
+async function init() {
+  buildGrid();
+
+  // Load cached data immediately so it's not blank
+  const hadCache = loadState();
+  if (hadCache) {
+    state.status = 'stale';
+    render();
+  }
+
+  // Fetch fresh prices (single API call for all 4 coins)
+  await fetchPrices();
+
+  // Fetch charts (sequential, with delays)
+  await fetchCharts();
+
+  // Polling
+  setInterval(fetchPrices, PRICE_INTERVAL);
+  setInterval(fetchCharts, CHART_INTERVAL);
+
+  // Update "ago" timer
+  setInterval(render, 10_000);
+}
+
+window.addEventListener('DOMContentLoaded', init);
+window.addEventListener('resize', render);
+</script>
+</body>
+</html>
